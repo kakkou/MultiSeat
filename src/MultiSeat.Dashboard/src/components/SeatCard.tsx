@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
-import type { SeatInfo, SeatServices, NvencQualityPreset } from "../api/types";
+import type { SeatInfo, SeatServices, NvencQualityPreset, ScaleFactorSource } from "../api/types";
 import { seats as seatsApi } from "../api/client";
 import { StatusBadge } from "./StatusBadge";
+import { ResizeControl } from "./ResizeControl";
 
 const PROVISION_STEPS: { key: string; label: string }[] = [
   { key: "Session",       label: "Session"    },
@@ -203,6 +204,12 @@ export function SeatCard({ seat, onUpdate }: Props) {
           <MoonlightAddress host={window.location.hostname} port={moonlightPort} />
         )}
 
+        {seat.scaleFactor > 0 && (
+          <div className="text-muted" style={{ fontSize: 12, marginTop: 8 }}>
+            Scale: {seat.scaleFactor}% ({scaleSourceLabel(seat.scaleFactorSource)})
+          </div>
+        )}
+
         {seat.launchApp && (
           <div className="text-muted" style={{ fontSize: 12, marginTop: 8 }}>
             App: {seat.launchApp}
@@ -255,6 +262,9 @@ export function SeatCard({ seat, onUpdate }: Props) {
             </div>
           </div>
         )}
+
+        {/* Live resize: only once the seat has a working session to reconnect (issue #70) */}
+        {isActive && <ResizeControl seat={seat} onUpdate={onUpdate} />}
 
         {/* Service Management Panel */}
         {showControls && (
@@ -596,4 +606,15 @@ function formatDuration(since: Date): string {
   if (mins < 60) return `${mins}m ${secs % 60}s`;
   const hrs = Math.floor(mins / 60);
   return `${hrs}h ${mins % 60}m`;
+}
+
+function scaleSourceLabel(source: ScaleFactorSource): string {
+  switch (source) {
+    case "Seat":
+      return "seat override";
+    case "HostDefault":
+      return "host default";
+    default:
+      return "from width";
+  }
 }
