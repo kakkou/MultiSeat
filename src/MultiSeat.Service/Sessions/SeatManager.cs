@@ -33,6 +33,15 @@ namespace MultiSeat.Service.Sessions;
 public sealed class SeatManager
 {
     private readonly ConcurrentDictionary<Guid, SeatInfo> _seats = new();
+
+    /// <summary>
+    /// Seats whose provisioning failed. Their resources were already released, by the failure
+    /// path in <see cref="ProvisionSeatAsync"/>, and they stay registered in Error only so the
+    /// dashboard can show why. Teardown must not release them a second time: by then their port
+    /// block may belong to a newer seat, and releasing it again would hand that seat's ports
+    /// out twice. Automatic retries tear such seats down routinely (issue #87), so this matters.
+    /// </summary>
+    private readonly ConcurrentDictionary<Guid, byte> _failedProvisions = new();
     private readonly ILogger<SeatManager> _logger;
     private readonly MultiSeatOptions _options;
     private readonly AccountManager _accounts;
@@ -217,6 +226,13 @@ public sealed class SeatManager
     /// none of which exist on a build agent. Nothing in production calls this.
     /// </summary>
     internal void RegisterSeatDirect(SeatInfo seat) => _seats[seat.Id] = seat;
+
+    /// <summary>
+    /// Record a registered seat as one whose provisioning failed, as the failure path in
+    /// <see cref="ProvisionSeatAsync"/> does. Exists for tests, for the same reason as
+    /// <see cref="RegisterSeatDirect"/>.
+    /// </summary>
+    internal void MarkProvisionFailedDirect(Guid seatId) => _failedProvisions[seatId] = 0;
 
     /// <summary>
     /// Full seat provisioning pipeline.
@@ -592,6 +608,7 @@ public sealed class SeatManager
 
             // Best-effort teardown of whatever was already provisioned
             await TeardownSeatInternalAsync(seat, CancellationToken.None);
+            _failedProvisions[seat.Id] = 0;
             throw;
         }
     }
@@ -671,6 +688,14 @@ public sealed class SeatManager
         seat.TransitionTo(SeatStatus.TearingDown, _logger);
         await BroadcastState(seat);
 
+        if (_failedProvisions.TryRemove(seat.Id, out _))
+        {
+            _logger.LogInformation(
+                "Seat {Id}: removed; its resources were already released when its provisioning failed",
+                seat.Id);
+            return;
+        }
+
         await TeardownSeatInternalAsync(seat, ct);
         _logger.LogInformation("Seat {Id}: torn down", seat.Id);
     }
@@ -733,13 +758,42 @@ public sealed class SeatManager
         try { _audioRouter.ReleaseCable(seat); } catch { /* best effort */ }
         try { await _firewall.ClosePortsAsync(seat, ct); } catch { /* best effort */ }
         try { await _displayManager.DestroyDisplayAsync(seat, ct); } catch { /* best effort */ }
-        try { _sessionLauncher.DisconnectSession(seat.SessionId); } catch { /* best effort */ }
-        try { _sessionLauncher.LogoffSession(seat.SessionId); } catch { /* best effort */ }
+        if (MayReleaseSession(SessionVerdictFor(seat)))
+        {
+            try { _sessionLauncher.DisconnectSession(seat.SessionId); } catch { /* best effort */ }
+            try { _sessionLauncher.LogoffSession(seat.SessionId); } catch { /* best effort */ }
+        }
+        else
+        {
+            _logger.LogWarning(
+                "Seat {Id}: Windows session {Sid} is logged on as another account now, so it is " +
+                "not this seat's to disconnect or log off; leaving it alone",
+                seat.Id, seat.SessionId);
+        }
         try { _portAllocator.Release(seat.PortBase); } catch { /* best effort */ }
 
         // Clean up per-seat Apollo config directory
         try { _configBuilder.CleanupConfig(seat.AccountName, _options.ApolloConfigDir); } catch { /* best effort */ }
     }
+
+    /// <summary>
+    /// What the seat's session number refers to now, or null when that cannot be asked (no
+    /// session launcher, as in tests that build this class with null subsystems, or a failing
+    /// lookup). Null is treated as before this check existed: the session is released.
+    /// </summary>
+    private SessionLauncher.SessionVerdict? SessionVerdictFor(SeatInfo seat)
+    {
+        try { return _sessionLauncher?.CheckSession(seat.SessionId, seat.AccountName).Verdict; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Whether teardown may disconnect and log off the seat's session number. Not when the
+    /// number is logged on as another account (issue #87): it is someone else's session now, and
+    /// both the logoff and the mstsc tracked under that number would hit them.
+    /// </summary>
+    internal static bool MayReleaseSession(SessionLauncher.SessionVerdict? verdict) =>
+        verdict != SessionLauncher.SessionVerdict.NotOurs;
 
     // ═══════════════════════════════════════════════════════════════════
     //  PER-SEAT SERVICE MANAGEMENT
@@ -1257,7 +1311,7 @@ public sealed class SeatManager
         seat.SessionId = await DisconnectAndRelaunchAsync(
             seat.SessionId,
             _sessionLauncher.DisconnectSession,
-            _sessionLauncher.IsSessionActive,
+            id => _sessionLauncher.IsSessionActive(id, seat.AccountName),
             token => _sessionLauncher.LaunchSessionAsync(seat.AccountName, token, geometry),
             _logger, ct);
         RecordScale(seat, geometry);
