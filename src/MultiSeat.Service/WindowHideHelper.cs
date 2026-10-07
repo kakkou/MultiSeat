@@ -36,8 +36,9 @@ internal static class WindowHideHelper
     /// of full-size window on the console user's display. Started BEFORE mstsc, the helper is
     /// already polling when that window appears and hides it within one poll interval.
     ///
-    /// Processes already running are recorded as a baseline and never touched, so an mstsc the
-    /// user started for their own remote desktop is left alone.
+    /// Only the first matching process is adopted. Once that process has been claimed, later
+    /// mstsc processes are ignored so a normal Remote Desktop connection started by the console
+    /// user cannot be hidden by a seat's long-lived watcher.
     /// </summary>
     /// <param name="processName">Process to watch for, without extension (i.e. "mstsc").</param>
     /// <param name="startedAfterUtc">
@@ -57,7 +58,7 @@ internal static class WindowHideHelper
     /// </param>
     public static bool WatchAndHideNew(string processName, DateTime startedAfterUtc, int adoptTimeoutSeconds)
     {
-        var adopted = new HashSet<int>();
+        int? adoptedPid = null;
         var adoptDeadline = DateTime.UtcNow.AddSeconds(adoptTimeoutSeconds);
         var hidden = 0;
 
@@ -68,13 +69,16 @@ internal static class WindowHideHelper
         {
             var current = CurrentPids(processName);
 
-            foreach (var pid in current)
+            var previousAdoptedPid = adoptedPid;
+            adoptedPid = SelectAdoptedPid(
+                adoptedPid, current, pid => StartedAfter(pid, startedAfterUtc));
+
+            if (previousAdoptedPid is null && adoptedPid is { } newlyAdoptedPid)
+                Console.Out.WriteLine(
+                    $"[WindowHide] Adopted new {processName} PID {newlyAdoptedPid}");
+
+            if (adoptedPid is { } pid && current.Contains(pid))
             {
-                if (!StartedAfter(pid, startedAfterUtc)) continue;
-
-                if (adopted.Add(pid))
-                    Console.Out.WriteLine($"[WindowHide] Adopted new {processName} PID {pid}");
-
                 foreach (var hWnd in FindVisibleClientWindows((uint)pid))
                 {
                     User32.ShowWindow(hWnd, Kernel32.SW_HIDE);
@@ -84,10 +88,12 @@ internal static class WindowHideHelper
                 }
             }
 
-            // Done once everything we adopted has exited...
-            if (adopted.Count > 0 && !adopted.Any(current.Contains)) break;
-            // ...or if nothing ever showed up.
-            if (adopted.Count == 0 && DateTime.UtcNow > adoptDeadline)
+            // Once a process is adopted, follow ONLY that process until it exits. In particular,
+            // do not adopt an unrelated mstsc the user starts later for a normal RDP connection.
+            if (adoptedPid is { } adopted && !current.Contains(adopted)) break;
+
+            // Give up only if no candidate ever appeared.
+            if (adoptedPid is null && DateTime.UtcNow > adoptDeadline)
             {
                 Console.Out.WriteLine($"[WindowHide] No new {processName} appeared within {adoptTimeoutSeconds}s");
                 break;
@@ -98,6 +104,26 @@ internal static class WindowHideHelper
 
         Console.Out.WriteLine($"[WindowHide] Stopped watching after hiding {hidden} window(s)");
         return true;
+    }
+
+    /// <summary>
+    /// Pick the first eligible process and keep that choice stable for the lifetime of the
+    /// watcher. A seat watcher must never switch to a later mstsc, because that later process
+    /// may be a normal Remote Desktop connection the console user started themselves.
+    /// </summary>
+    internal static int? SelectAdoptedPid(
+        int? adoptedPid, IEnumerable<int> currentPids, Func<int, bool> isEligible)
+    {
+        if (adoptedPid is not null)
+            return adoptedPid;
+
+        foreach (var pid in currentPids)
+        {
+            if (isEligible(pid))
+                return pid;
+        }
+
+        return null;
     }
 
     private static HashSet<int> CurrentPids(string processName)
