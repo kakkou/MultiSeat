@@ -61,6 +61,28 @@ public sealed class MultiSeatOptions
     /// </summary>
     public bool KeepaliveOnSeparateDesktop { get; set; } = true;
 
+    /// <summary>
+    /// Issue #96 diagnostic. When true, every provision launches a background probe inside the
+    /// new seat session (parallel to Apollo's own startup, never blocking it) that samples
+    /// <c>OpenInputDesktop</c> and the active display identity every 250ms for
+    /// <see cref="InputDesktopReadinessProbeSeconds"/>, writing a timestamped JSONL timeline to
+    /// <c>C:\ProgramData\MultiSeat\ms_inputdesktop_readiness_{seatId}.jsonl</c>.
+    ///
+    /// Off by default — it is a diagnostic for one open question (does a fresh seat session's
+    /// input desktop ever become accessible on its own, and how does the RDP display identity
+    /// change when it does), not something every host needs running on every provision.
+    /// See scripts\diagnose-issue96.ps1, which drives repeated trials under both values of
+    /// <see cref="KeepaliveOnSeparateDesktop"/> and aggregates the result.
+    /// </summary>
+    public bool DiagnoseInputDesktopReadiness { get; set; } = false;
+
+    /// <summary>
+    /// How long the issue #96 probe (<see cref="DiagnoseInputDesktopReadiness"/>) samples for.
+    /// The reporter's own fixed-delay testing (0/1/3/5/10s) never resolved the failure, so this
+    /// defaults well past that to answer whether it is a slow race or a true deadlock.
+    /// </summary>
+    public int InputDesktopReadinessProbeSeconds { get; set; } = 90;
+
     public bool RotateSharedSeatTls { get; set; }
 
     /// <summary>
@@ -407,6 +429,36 @@ public sealed class MultiSeatOptions
     public int SessionConnectTimeoutMs { get; set; } = 15_000;
     public int ProcessLaunchTimeoutMs { get; set; } = 10_000;
     public int HealthCheckIntervalMs { get; set; } = 5_000;
+
+    /// <summary>
+    /// How long <c>ApolloReadiness.WaitAsync</c> polls a freshly-started seat's Apollo for its
+    /// serverinfo API before giving up. Default 30 (<see cref="Streaming.ApolloReadiness.StartupTimeout"/>'s
+    /// own value, unchanged) - this exists to make that number configurable, not to change it.
+    ///
+    /// Issue #96: a provisioning failure anywhere in <c>SeatManager.ProvisionSeatAsync</c> tears
+    /// the seat down immediately (<c>TeardownSeatInternalAsync</c> in the catch block), including
+    /// the Windows session itself - so this is the ONE thing standing between "Apollo never came
+    /// up" and a long, undisturbed observation window for whatever kept it from coming up.
+    /// Widening this alongside <see cref="DiagnoseInputDesktopReadiness"/> and a matching
+    /// <see cref="InputDesktopReadinessProbeSeconds"/> is how to find out whether a given failure
+    /// is a slow race (resolves given enough patience) or a true deadlock (does not, no matter how
+    /// long provisioning is willing to wait) - the real provisioning flow gets to run that long
+    /// instead of being cut off at 30s regardless of what the probe itself observes.
+    /// </summary>
+    public int ApolloReadinessTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Issue #96. Before starting a seat's Apollo, wait up to this many seconds for the seat
+    /// session's input desktop to be openable and stay openable (<see cref="InputDesktopStableMs"/>).
+    /// Apollo's capture setup fails once if the desktop is denied and never retries, while the
+    /// seat would still report Ready. A third-party logon task (reported: ASUS Armoury Crate) can
+    /// hold the desktop for about two minutes. On timeout Apollo is started anyway, as before,
+    /// with a warning. 0 disables the wait.
+    /// </summary>
+    public int WaitForInputDesktopSeconds { get; set; } = 180;
+
+    /// <summary>How long the input desktop must stay openable before Apollo is started.</summary>
+    public int InputDesktopStableMs { get; set; } = 3000;
 
     // ── Shared game library ──────────────────────────────────────────
     // Create a shared games/ROMs location all seat accounts can read/write, so a Steam game
